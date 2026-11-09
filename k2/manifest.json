@@ -1,0 +1,13 @@
+{
+  "label": "David Garcia Karoo (Karoo 2)",
+  "packageName": "com.davidgarcia.karoo",
+  "latestApkUrl": "https://github.com/DavidGarciaLLion/DavidGarciaKaroo/releases/download/v1.2.2-k2/DavidGarciaKaroo-K2.apk",
+  "latestVersion": "1.2.2-K2",
+  "latestVersionCode": 12,
+  "iconUrl": "https://raw.githubusercontent.com/DavidGarciaLLion/DavidGarciaKaroo/master/icon_foreground.png",
+  "developer": "David Garcia",
+  "description": "Automatically scrolls through your ride data pages so you can focus on riding. Navigation-aware: switches to the map page before a turn and resumes scrolling after it. Per-page dwell time, skip pages, optional sound feedback.",
+  "releaseNotes": "",
+  "screenshotUrls": [],
+  "tags": ["performance"]
+}

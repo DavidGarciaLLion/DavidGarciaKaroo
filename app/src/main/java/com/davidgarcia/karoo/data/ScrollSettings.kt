@@ -1,0 +1,79 @@
+package com.davidgarcia.karoo.data
+
+import android.content.Context
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
+
+val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "davidgarcia_settings")
+
+// Karoo OS allows 12 data pages per profile (Hammerhead support, "Karoo OS - Customising Profiles"); with 10 here
+// the 11th and 12th pages were unknown to the controller and the sequence broke (24/10/2026)
+const val MAX_PAGES = 12
+const val DEFAULT_DWELL_MS = 5_000L
+const val DEFAULT_NEAR_CUE_M = 25f
+const val DEFAULT_POST_TURN_M = 10f
+
+data class ScrollConfig(
+    val isEnabled: Boolean = false,
+    val pageDwellMs: List<Long> = emptyList(),
+    val nearCueDistanceM: Float = DEFAULT_NEAR_CUE_M,
+    val postTurnDistanceM: Float = DEFAULT_POST_TURN_M,
+    val soundEnabled: Boolean = true,
+    val nearCueEnabled: Boolean = true,
+    /** The bottom-left button (lap) also pauses/resumes the loop. Off: it only marks the lap. */
+    val lapButtonPauses: Boolean = true
+) {
+    fun dwellForPage(index: Int): Long =
+        pageDwellMs.getOrElse(index) { DEFAULT_DWELL_MS }
+}
+
+object PrefsKeys {
+    val IS_ENABLED = booleanPreferencesKey("is_enabled")
+    val PAGE_DWELL_MS = stringPreferencesKey("page_dwell_ms")
+    val NEAR_CUE_DISTANCE_M = floatPreferencesKey("near_cue_distance_m")
+    val POST_TURN_DISTANCE_M = floatPreferencesKey("post_turn_distance_m")
+    val SOUND_ENABLED = booleanPreferencesKey("sound_enabled")
+    val NEAR_CUE_ENABLED = booleanPreferencesKey("near_cue_enabled")
+    val LAP_BUTTON_PAUSES = booleanPreferencesKey("lap_button_pauses")
+}
+
+private fun String.toPageDwellList(): List<Long> =
+    split(",").mapNotNull { it.trim().toLongOrNull() }
+
+private fun List<Long>.toPageDwellString(): String = joinToString(",")
+
+fun Context.scrollConfigFlow(): Flow<ScrollConfig> =
+    dataStore.data.map { prefs ->
+        ScrollConfig(
+            isEnabled = prefs[PrefsKeys.IS_ENABLED] ?: false,
+            pageDwellMs = prefs[PrefsKeys.PAGE_DWELL_MS]?.toPageDwellList() ?: emptyList(),
+            nearCueDistanceM = prefs[PrefsKeys.NEAR_CUE_DISTANCE_M] ?: DEFAULT_NEAR_CUE_M,
+            postTurnDistanceM = prefs[PrefsKeys.POST_TURN_DISTANCE_M] ?: DEFAULT_POST_TURN_M,
+            soundEnabled = prefs[PrefsKeys.SOUND_ENABLED] ?: true,
+            nearCueEnabled = prefs[PrefsKeys.NEAR_CUE_ENABLED] ?: true,
+            lapButtonPauses = prefs[PrefsKeys.LAP_BUTTON_PAUSES] ?: true
+        )
+    }
+
+suspend fun Context.saveScrollEnabled(enabled: Boolean) {
+    dataStore.edit { it[PrefsKeys.IS_ENABLED] = enabled }
+}
+
+suspend fun Context.saveScrollConfig(config: ScrollConfig) {
+    dataStore.edit { prefs ->
+        prefs[PrefsKeys.IS_ENABLED] = config.isEnabled
+        prefs[PrefsKeys.PAGE_DWELL_MS] = config.pageDwellMs.toPageDwellString()
+        prefs[PrefsKeys.NEAR_CUE_DISTANCE_M] = config.nearCueDistanceM
+        prefs[PrefsKeys.POST_TURN_DISTANCE_M] = config.postTurnDistanceM
+        prefs[PrefsKeys.SOUND_ENABLED] = config.soundEnabled
+        prefs[PrefsKeys.NEAR_CUE_ENABLED] = config.nearCueEnabled
+        prefs[PrefsKeys.LAP_BUTTON_PAUSES] = config.lapButtonPauses
+    }
+}

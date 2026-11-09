@@ -1,0 +1,392 @@
+package com.davidgarcia.karoo.controller
+
+import android.content.Context
+import android.util.Log
+import com.davidgarcia.karoo.R
+import com.davidgarcia.karoo.data.MAX_PAGES
+import com.davidgarcia.karoo.data.ScrollConfig
+import com.davidgarcia.karoo.data.saveScrollEnabled
+import com.davidgarcia.karoo.data.scrollConfigFlow
+import io.hammerhead.karooext.KarooSystemService
+import io.hammerhead.karooext.models.ActiveRidePage
+import io.hammerhead.karooext.models.ActiveRideProfile
+import io.hammerhead.karooext.models.DataType
+import io.hammerhead.karooext.models.InRideAlert
+import io.hammerhead.karooext.models.Lap
+import io.hammerhead.karooext.models.OnStreamState
+import io.hammerhead.karooext.models.PerformHardwareAction
+import io.hammerhead.karooext.models.PlayBeepPattern
+import io.hammerhead.karooext.models.RideProfile
+import io.hammerhead.karooext.models.RideState
+import io.hammerhead.karooext.models.ShowMapPage
+import io.hammerhead.karooext.models.StreamState
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+
+private const val TAG = "AutoScrollController"
+
+private const val RESUME_ALERT_DELAY_MS = 3_000L
+
+enum class ScrollState { INACTIVE, SCROLLING, NEAR_CUE, POST_TURN, PAUSED }
+
+class AutoScrollController(
+    private val context: Context,
+    private val karooSystem: KarooSystemService
+) {
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    @Volatile private var scrollState = ScrollState.INACTIVE
+    @Volatile private var stateBeforeCue = ScrollState.INACTIVE
+    @Volatile private var rideActive = false
+
+    // Consumers run on binder threads, the scroll loop on Dispatchers.Default: no locking
+    // needed (events never overlap in practice) but writes must be visible across threads.
+    @Volatile private var currentPageIndex = 0
+    // Pages set to 0 s are skipped with presses sent back to back; the page events of
+    // the skipped ones arrive too and are ignored until burstTarget shows up (2 s at most).
+    @Volatile private var burstTarget = -1
+    @Volatile private var burstAt = 0L
+    @Volatile private var pages: List<RideProfile.Page> = emptyList()
+    @Volatile private var config = ScrollConfig()
+
+    private var scrollJob: Job? = null
+    private var nearCueJob: Job? = null
+    private var resumeAlertJob: Job? = null
+    @Volatile private var started = false
+
+    @Volatile private var lastDistanceToTurn = Double.MAX_VALUE
+    @Volatile private var odometerAtTurn = 0.0
+    @Volatile private var currentOdometer = 0.0
+
+    private val consumerIds = mutableListOf<String>()
+    private var navConsumerIds = mutableListOf<String>()
+
+    @OptIn(FlowPreview::class)
+    fun start() {
+        if (started) return
+        started = true
+
+        scope.launch {
+            context.scrollConfigFlow().debounce(300L).collect { cfg ->
+                val enabledChanged = cfg.isEnabled != config.isEnabled
+                config = cfg
+                if (enabledChanged) {
+                    if (rideActive) {
+                        if (cfg.isEnabled && scrollState == ScrollState.INACTIVE) {
+                            enterScrolling()
+                        } else if (!cfg.isEnabled) {
+                            enterInactive()
+                        }
+                    } else {
+                        notifyToggle(cfg.isEnabled)
+                    }
+                }
+            }
+        }
+
+        consumerIds += karooSystem.addConsumer { state: RideState ->
+            when (state) {
+                RideState.Recording -> {
+                    rideActive = true
+                    subscribeToNavigationStreams()
+                    if (config.isEnabled && scrollState == ScrollState.INACTIVE) {
+                        scope.launch { enterScrolling() }
+                    }
+                }
+                else -> {
+                    rideActive = false
+                    pauseNavigationStreams()
+                    // Manual pause must survive ride auto-pause: only a ride end (Idle) clears it
+                    val keepPaused = state is RideState.Paused && scrollState == ScrollState.PAUSED
+                    if (scrollState != ScrollState.INACTIVE && !keepPaused) {
+                        scrollJob?.cancel()
+                        nearCueJob?.cancel()
+                        resumeAlertJob?.cancel()
+                        scrollState = ScrollState.INACTIVE
+                        stateBeforeCue = ScrollState.INACTIVE
+                        scope.launch { notifyToggle(false) }
+                    }
+                }
+            }
+        }
+
+        consumerIds += karooSystem.addConsumer { event: ActiveRideProfile ->
+            pages = event.profile.pages.take(MAX_PAGES)
+        }
+
+        consumerIds += karooSystem.addConsumer { event: ActiveRidePage ->
+            val idx = pages.indexOf(event.page)
+            if (idx >= 0) {
+                if (burstTarget >= 0 && idx != burstTarget && System.currentTimeMillis() - burstAt < 2_000L) {
+                    return@addConsumer
+                }
+                burstTarget = -1
+                currentPageIndex = idx
+                if (scrollState == ScrollState.SCROLLING) {
+                    scope.launch { scheduleNextScroll() }
+                }
+            }
+        }
+
+        consumerIds += karooSystem.addConsumer { lap: Lap ->
+            Log.d(TAG, "Lap #${lap.number} trigger=${lap.trigger}")
+            if (config.lapButtonPauses) togglePause() else Log.d(TAG, "Lap ignored: bottom-left button option is off")
+        }
+    }
+
+    private fun togglePause() {
+        when (scrollState) {
+            ScrollState.SCROLLING -> pauseRotation()
+            ScrollState.NEAR_CUE, ScrollState.POST_TURN -> {
+                if (stateBeforeCue == ScrollState.SCROLLING) pauseRotation()
+            }
+            ScrollState.PAUSED -> enterScrolling()
+            ScrollState.INACTIVE -> {}
+        }
+    }
+
+    private fun pauseRotation() {
+        Log.d(TAG, "Pause toggle → PAUSED")
+        scrollJob?.cancel()
+        nearCueJob?.cancel()
+        resumeAlertJob?.cancel()
+        scrollState = ScrollState.PAUSED
+        stateBeforeCue = ScrollState.INACTIVE
+        try {
+            karooSystem.dispatch(ShowMapPage(zoom = false))
+        } catch (e: Exception) {
+            Log.e(TAG, "dispatch ShowMapPage failed", e)
+        }
+        notifyToggle(false, R.string.alert_scroll_paused)
+    }
+
+    private fun subscribeToNavigationStreams() {
+        if (navConsumerIds.isNotEmpty()) return
+
+        navConsumerIds += karooSystem.addConsumer(
+            OnStreamState.StartStreaming(DataType.Type.DISTANCE_TO_NEXT_TURN)
+        ) { event: OnStreamState ->
+            val state = event.state
+            if (state is StreamState.Streaming) {
+                val dist = state.dataPoint.values[DataType.Field.DISTANCE_TO_NEXT_TURN]
+                    ?: return@addConsumer
+                onDistanceToTurn(dist)
+            }
+        }
+
+        navConsumerIds += karooSystem.addConsumer(
+            OnStreamState.StartStreaming(DataType.Type.DISTANCE)
+        ) { event: OnStreamState ->
+            val state = event.state
+            if (state is StreamState.Streaming) {
+                val dist = state.dataPoint.values[DataType.Field.DISTANCE]
+                    ?: return@addConsumer
+                currentOdometer = dist
+                if (scrollState == ScrollState.POST_TURN) {
+                    val traveled = currentOdometer - odometerAtTurn
+                    if (traveled >= config.postTurnDistanceM) onPostTurnComplete()
+                }
+            }
+        }
+    }
+
+    private fun pauseNavigationStreams() {
+        navConsumerIds.forEach { karooSystem.removeConsumer(it) }
+        navConsumerIds.clear()
+        lastDistanceToTurn = Double.MAX_VALUE
+    }
+
+    private fun onDistanceToTurn(dist: Double) {
+        if (!config.nearCueEnabled) {
+            lastDistanceToTurn = dist
+            return
+        }
+        val threshold = config.nearCueDistanceM.toDouble()
+        when (scrollState) {
+            ScrollState.SCROLLING -> {
+                if (dist < threshold) {
+                    Log.d(TAG, "Near cue at ${dist}m → map")
+                    stateBeforeCue = ScrollState.SCROLLING
+                    scrollState = ScrollState.NEAR_CUE
+                    scrollJob?.cancel()
+                    startNearCueTimeout()
+                    try {
+                        karooSystem.dispatch(ShowMapPage(zoom = false))
+                    } catch (e: Exception) {
+                        Log.e(TAG, "dispatch ShowMapPage failed", e)
+                    }
+                }
+            }
+            ScrollState.INACTIVE -> {
+                if (dist < threshold) {
+                    stateBeforeCue = ScrollState.INACTIVE
+                    scrollState = ScrollState.NEAR_CUE
+                    startNearCueTimeout()
+                    try {
+                        karooSystem.dispatch(ShowMapPage(zoom = false))
+                    } catch (e: Exception) {
+                        Log.e(TAG, "dispatch ShowMapPage failed", e)
+                    }
+                }
+            }
+            ScrollState.NEAR_CUE -> {
+                if (dist > threshold && lastDistanceToTurn < threshold) {
+                    Log.d(TAG, "Turn completed → POST_TURN")
+                    nearCueJob?.cancel()
+                    odometerAtTurn = currentOdometer
+                    scrollState = ScrollState.POST_TURN
+                }
+            }
+            ScrollState.POST_TURN -> {
+                if (dist < threshold) {
+                    Log.d(TAG, "Near cue during POST_TURN at ${dist}m → map priority")
+                    scrollState = ScrollState.NEAR_CUE
+                    startNearCueTimeout()
+                    try {
+                        karooSystem.dispatch(ShowMapPage(zoom = false))
+                    } catch (e: Exception) {
+                        Log.e(TAG, "dispatch ShowMapPage failed", e)
+                    }
+                }
+            }
+            ScrollState.PAUSED -> {}
+        }
+        lastDistanceToTurn = dist
+    }
+
+    private fun startNearCueTimeout() {
+        nearCueJob?.cancel()
+        nearCueJob = scope.launch {
+            delay(60_000L)
+            if (isActive && scrollState == ScrollState.NEAR_CUE) {
+                Log.w(TAG, "NEAR_CUE timeout → forcing POST_TURN")
+                odometerAtTurn = currentOdometer
+                scrollState = ScrollState.POST_TURN
+            }
+        }
+    }
+
+    private fun onPostTurnComplete() {
+        Log.d(TAG, "Post-turn distance reached → back to $stateBeforeCue")
+        when (stateBeforeCue) {
+            ScrollState.SCROLLING -> {
+                enterScrolling(notify = false)
+                scheduleResumeAlert()
+            }
+            else -> scrollState = ScrollState.INACTIVE
+        }
+    }
+
+    private fun scheduleResumeAlert() {
+        resumeAlertJob?.cancel()
+        resumeAlertJob = scope.launch {
+            delay(RESUME_ALERT_DELAY_MS)
+            if (isActive && scrollState == ScrollState.SCROLLING) {
+                notifyToggle(true)
+            }
+        }
+    }
+
+    fun toggle() {
+        scope.launch {
+            val newEnabled = !config.isEnabled
+            context.saveScrollEnabled(newEnabled)
+        }
+    }
+
+    private fun enterScrolling(notify: Boolean = true) {
+        scrollState = ScrollState.SCROLLING
+        if (notify) {
+            resumeAlertJob?.cancel()
+            notifyToggle(true)
+        }
+        scheduleNextScroll()
+    }
+
+    private fun enterInactive() {
+        scrollState = ScrollState.INACTIVE
+        scrollJob?.cancel()
+        resumeAlertJob?.cancel()
+        notifyToggle(false)
+    }
+
+    private fun scheduleNextScroll() {
+        scrollJob?.cancel()
+        scrollJob = scope.launch {
+            val dwell = config.dwellForPage(currentPageIndex)
+            if (dwell > 0L) delay(dwell.coerceAtLeast(1000L))   // a 0 s page reached by hand is left at once
+            if (isActive && scrollState == ScrollState.SCROLLING && pages.size > 1) {
+                // One press per page to skip, plus one, all back to back: the ride app never
+                // gets to draw the skipped pages (verified 16/10 with screen recordings; with
+                // a 50 ms gap they showed for 80 ms, with the old wait-for-page-event much longer).
+                var presses = 1
+                var next = (currentPageIndex + 1) % pages.size
+                while (config.dwellForPage(next) == 0L && presses < pages.size) {
+                    presses++
+                    next = (next + 1) % pages.size
+                }
+                burstTarget = next
+                burstAt = System.currentTimeMillis()
+                try {
+                    repeat(presses) { karooSystem.dispatch(PerformHardwareAction.TopRightPress) }
+                } catch (e: Exception) {
+                    Log.e(TAG, "dispatch TopRightPress failed", e)
+                    burstTarget = -1
+                    scheduleNextScroll()
+                }
+            }
+        }
+    }
+
+    private fun notifyToggle(
+        enabled: Boolean,
+        titleRes: Int = if (enabled) R.string.alert_scroll_on else R.string.alert_scroll_off
+    ) {
+        try {
+            karooSystem.dispatch(
+                InRideAlert(
+                    id = "autoloop_toggle_${System.currentTimeMillis()}",
+                    icon = R.drawable.ic_toggle,
+                    title = context.getString(titleRes),
+                    detail = null,
+                    autoDismissMs = 2_000L,
+                    backgroundColor = if (enabled) R.color.alert_on_background else R.color.alert_off_background,
+                    textColor = R.color.alert_text
+                )
+            )
+            if (config.soundEnabled) {
+                val tones: List<PlayBeepPattern.Tone> = if (enabled) {
+                    listOf(
+                        PlayBeepPattern.Tone(frequency = 1000, durationMs = 80),
+                        PlayBeepPattern.Tone(frequency = null, durationMs = 40),
+                        PlayBeepPattern.Tone(frequency = 1500, durationMs = 120)
+                    )
+                } else {
+                    listOf(PlayBeepPattern.Tone(frequency = 800, durationMs = 200))
+                }
+                karooSystem.dispatch(PlayBeepPattern(tones = tones))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "dispatch notify failed", e)
+        }
+    }
+
+    fun stop() {
+        scrollJob?.cancel()
+        nearCueJob?.cancel()
+        resumeAlertJob?.cancel()
+        navConsumerIds.forEach { karooSystem.removeConsumer(it) }
+        navConsumerIds.clear()
+        consumerIds.forEach { karooSystem.removeConsumer(it) }
+        consumerIds.clear()
+        scope.cancel()
+    }
+}
